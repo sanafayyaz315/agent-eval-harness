@@ -341,6 +341,83 @@ class TestResolvePrompt:
 class TestRunCaseEnvForwarding:
     """Tests verifying _run_case passes env to sandbox.exec()."""
 
+    def test_diagnostic_helpers_keep_only_assistant_text_and_redact_secret(self, monkeypatch, tmp_path):
+        from agent_eval.openshell.run import _last_assistant_text, _write_failure
+
+        monkeypatch.setenv("TEST_API_TOKEN", "secret-value-123")
+        assert _last_assistant_text([
+            {"type": "assistant", "text": "First thought"},
+            {"type": "tool", "text": "tool output"},
+            {"type": "assistant", "text": "Partial recommendation"},
+        ]) == "Partial recommendation"
+        _write_failure(tmp_path, "preflight", "Bearer abc123 secret-value-123", 124)
+        failure = json.loads((tmp_path / "failure.json").read_text())
+        assert failure["exit_code"] == 124
+        assert "secret-value-123" not in failure["error"]
+        assert "abc123" not in failure["error"]
+
+    def test_create_failure_writes_diagnostic(self, tmp_path):
+        from agent_eval.openshell.run import _run_case
+        from agent_eval.openshell.sandbox import OpenShellSandbox
+        import asyncio
+
+        case = tmp_path / "cases" / "early-failure"
+        case.mkdir(parents=True)
+        sandbox = MagicMock(spec=OpenShellSandbox)
+        sandbox.create = AsyncMock(side_effect=RuntimeError("image pull refused"))
+        sandbox.delete = AsyncMock()
+        with pytest.raises(RuntimeError, match="image pull refused"):
+            asyncio.run(_run_case(sandbox, _mock_config(prompt="test"), case,
+                                  "model", "image:v1", tmp_path / "runs",
+                                  asyncio.Semaphore(1), keep=False, scene_active=True))
+        failure = json.loads((tmp_path / "runs/cases/early-failure/failure.json").read_text())
+        assert failure["phase"] == "sandbox-create"
+        assert "image pull refused" in failure["error"]
+
+    def test_agent_failure_preserves_partial_text_only_as_diagnostic(self, tmp_path, monkeypatch):
+        from agent_eval.openshell.run import _run_case
+        from agent_eval.openshell.sandbox import OpenShellSandbox
+        import asyncio
+
+        case = tmp_path / "cases" / "agent-failure"
+        case.mkdir(parents=True)
+        (case / "input.yaml").write_text("prompt: test\n")
+        config = _mock_config(prompt="test")
+        config.runner.type = "openclaw"
+        config.runner.providers = None
+        sandbox = MagicMock(spec=OpenShellSandbox)
+        sandbox.create = AsyncMock()
+        sandbox.upload = AsyncMock()
+        sandbox.download = AsyncMock()
+        sandbox.delete = AsyncMock()
+        error_envelope = json.dumps({"ok": False, "status": "error", "final": "",
+            "error": {"message": "malformed tool call"},
+            "payloads": [{"text": "malformed tool call", "isError": True}]})
+
+        async def fake_exec(_name, command, **_kwargs):
+            if command[:2] == ["sh", "-c"] and command[2].startswith("test -e "):
+                return SimpleNamespace(return_code=1, stdout="", stderr="")
+            if command and command[0] == "openclaw":
+                return SimpleNamespace(return_code=1, stdout=error_envelope, stderr="")
+            return SimpleNamespace(return_code=0, stdout="", stderr="")
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+
+        async def fake_harvest(_sandbox, _name, *, case_output, **_kwargs):
+            (case_output / "openclaw-trajectory-events.jsonl").write_text("observed transcript")
+            return [{"type": "assistant", "text": "I found one blocker, but have not finished."}]
+        monkeypatch.setattr("agent_eval.openshell.run._harvest_openclaw_events", fake_harvest)
+
+        result = asyncio.run(_run_case(sandbox, config, case, "model", "image:v1",
+                                   tmp_path / "runs", asyncio.Semaphore(1),
+                                   keep=False, scene_active=True))
+        case_output = tmp_path / "runs/cases/agent-failure"
+        assert result["exit_code"] == 1
+        assert (case / "output/response.txt").read_text() == ""
+        assert (case_output / "agent-response.txt").read_text() == "I found one blocker, but have not finished."
+        failure = json.loads((case_output / "failure.json").read_text())
+        assert failure["phase"] == "agent-exec"
+        assert "malformed tool call" in failure["error"]
+
     def test_run_case_passes_env_to_exec(self, tmp_path):
         """Verify sandbox.exec receives forwarded env vars."""
         from agent_eval.openshell.run import _run_case

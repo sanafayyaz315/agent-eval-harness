@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shlex
+import re
 import subprocess
 import sys
 import time
@@ -37,6 +38,40 @@ from agent_eval.events import (
 from agent_eval.openshell.sandbox import OpenShellSandbox
 
 logger = logging.getLogger(__name__)
+
+
+def _diagnostic_text(value: object) -> str:
+    """Remove known credential values before writing routine diagnostics."""
+    result = str(value)
+    for key, secret in os.environ.items():
+        if secret and len(secret) >= 8 and ("TOKEN" in key or "KEY" in key or "SECRET" in key):
+            result = result.replace(secret, "[REDACTED]")
+    result = re.sub(r"(?i)Bearer\s+[^\s\"']+", "Bearer [REDACTED]", result)
+    return result
+
+
+def _last_assistant_text(events: list) -> str:
+    """Return observed assistant text, never a tool result or user prompt."""
+    for event in reversed(events):
+        if event.get("type") == "assistant" and isinstance(event.get("text"), str):
+            if event["text"].strip():
+                return event["text"]
+    return ""
+
+
+def _write_failure(case_output: Path, phase: str, error: object, exit_code: int | None = None) -> None:
+    failure = {
+        "phase": phase,
+        "exit_code": exit_code,
+        "error": _diagnostic_text(error),
+        "artifacts": [name for name in (
+            "stdout.log", "stderr.log", "run_result.json", "events.json",
+            "openclaw-trajectory-events.jsonl", "agent-response.txt",
+        ) if (case_output / name).is_file()],
+    }
+    (case_output / "failure.json").write_text(json.dumps(failure, indent=2))
+    logger.error("Case %s failed in %s (rc=%s): %s; diagnostics: %s",
+                 case_output.name, phase, exit_code, failure["error"], case_output)
 
 SCRIPTS_DIR = Path(__file__).parents[2] / "skills" / "eval-run" / "scripts"
 
@@ -1173,6 +1208,7 @@ async def _run_case(
     case_id = staged_case.name
     case_output = output_dir / "cases" / case_id
     case_output.mkdir(parents=True, exist_ok=True)
+    phase = "sandbox-create"
 
     async with sem:
         # OpenShell sandbox names max 19 chars: prefix(2) + hex(8) + dash + digits
@@ -1181,6 +1217,7 @@ async def _run_case(
         try:
             logger.info(f"Creating sandbox {name} for case {case_id}")
             await sandbox.create(name, image)
+            phase = "bootstrap"
             forge_image = os.environ.get("AGENT_EVAL_OPENSHELL_WORKSPACE") == "forge-image"
             if forge_image:
                 from agent_eval.openshell.forge import prepare_forge_sandbox
@@ -1239,6 +1276,7 @@ async def _run_case(
                 prompt = f"{str(system_prompt).strip()}\n\n{prompt}"
 
             # Skip per-case seeding when a scene was seeded at run start
+            phase = "case-setup"
             sandbox_env_extra: dict[str, str] = {}
             if not scene_active:
                 # Optional host-side seeds (Crabline Slack / smolclaw Gmail|Calendar)
@@ -1415,6 +1453,7 @@ async def _run_case(
                             "fs.writeFileSync(p,JSON.stringify(c));",
                         ],
                     )
+                    phase = "preflight"
                     await _run_openclaw_llm_preflight(
                         sandbox, name, config_path, openclaw_model
                     )
@@ -1448,6 +1487,7 @@ async def _run_case(
                 cmd[:-1] if len(cmd) > 1 else cmd,
             )
             timeout = (config.execution.timeout or 600) + 60
+            phase = "agent-exec"
             result = await sandbox.exec(
                 name,
                 cmd,
@@ -1460,14 +1500,14 @@ async def _run_case(
             duration_s = time.monotonic() - start_time
             if result.return_code:
                 logger.warning(
-                    "Case %s sandbox exec rc=%s duration=%.2fs stderr=%r stdout=%r",
+                    "Case %s sandbox exec rc=%s duration=%.2fs stderr=%r; full output in case artifacts",
                     case_id,
                     result.return_code,
                     duration_s,
-                    (result.stderr or "")[:800],
-                    (result.stdout or "")[:400],
+                    _diagnostic_text(result.stderr or "")[:300],
                 )
 
+            phase = "artifact-collection"
             for output in config.outputs or []:
                 if output.path:
                     # OpenClaw's response is collected from stdout below. Its
@@ -1508,7 +1548,9 @@ async def _run_case(
                 output_dir.mkdir(exist_ok=True)
                 (output_dir / "response.txt").write_text(response_text)
 
+                events = []
                 try:
+                    phase = "trajectory"
                     events = await _harvest_openclaw_events(
                         sandbox,
                         name,
@@ -1527,6 +1569,17 @@ async def _run_case(
                     )
                 except Exception as e:
                     logger.warning(f"Failed to generate events.json for {case_id}: {e}")
+                finally:
+                    # Diagnostic only: a partial answer is not the final answer
+                    # judges read from output/response.txt.
+                    # Error envelopes can contain an isError payload; the
+                    # fallback event parser may label it as assistant text.
+                    # On failure trust only a real session/trajectory export.
+                    has_transcript = (case_output / "openclaw-trajectory-events.jsonl").is_file()
+                    partial = _last_assistant_text(events) if (not result.return_code or has_transcript) else ""
+                    if not partial and case_result.get("response_text"):
+                        partial = case_result["response_text"]
+                    (case_output / "agent-response.txt").write_text(partial)
             else:
                 # Generic result for cli/claude-code runners
                 case_result = {
@@ -1550,10 +1603,16 @@ async def _run_case(
                 json.dump(case_result, f, indent=2)
             (case_output / "stdout.log").write_text(result.stdout)
             (case_output / "stderr.log").write_text(result.stderr)
+            if result.return_code:
+                detail = case_result.get("stderr") or result.stderr or "Agent exited without a final response"
+                _write_failure(case_output, "agent-exec", detail, result.return_code)
 
             logger.info(f"Case {case_id} completed with exit code {result.return_code}")
             return case_result
 
+        except Exception as e:
+            _write_failure(case_output, phase, e)
+            raise
         finally:
             if not keep:
                 await sandbox.delete(name)

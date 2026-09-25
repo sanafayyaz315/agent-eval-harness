@@ -84,3 +84,23 @@ call`; its trajectory was harvested. The AEH report recorded mean reward
 `0.150`, pass rate `1/2`, and a failed recommendation against threshold
 `0.5`. MLflow run `71e3fde3e22a4a8da3bb36570b36c0b8` includes two traces.
 The PipelineRun also had the independent `ose-cli:latest` cleanup pull failure.
+
+## Per-case failure diagnostics
+
+The same fix branch now writes `cases/<case>/failure.json` when sandbox setup,
+preflight, agent execution, or artifact handling fails. It records the phase,
+exit code when available, redacted error summary, and available artifact names.
+The Tekton log prints a short pointer to that directory. Existing `stdout.log`,
+`stderr.log`, `run_result.json`, `events.json`, and raw trajectory exports remain
+the detailed evidence.
+
+For OpenClaw cases, `cases/<case>/agent-response.txt` holds the last observed
+assistant-visible text, including a partial answer from a harvested transcript.
+It is diagnostic only. The scored `output/response.txt` remains empty for an
+OpenClaw error, so a partial answer cannot be mistaken for a completed brief.
+If no trustworthy assistant text was observed, `agent-response.txt` is empty.
+This does not expose provider-internal reasons for a malformed call; it shows
+where the run stopped and what the agent visibly produced beforehand.
+
+Focused harness tests cover early sandbox failure, a malformed-call result
+after partial assistant output, credential redaction, and response separation.
