@@ -17,8 +17,10 @@ from agent_eval.openshell.run import (
     _child_env,
     _ensure_m365_credentials,
     _install_m365_file_auth,
+    _log_openclaw_response,
     _m365_usable,
     _openai_compat_base_url,
+    _log_raw_model_response,
     _resolve_prompt,
     _sandbox_env,
     _stage_forge_ai_gateway_ca,
@@ -26,6 +28,46 @@ from agent_eval.openshell.run import (
     build_openclaw_eval_config,
     qualify_openclaw_model,
 )
+
+
+def test_openclaw_response_logging_keeps_fallback_separate_from_model_text(tmp_path, caplog):
+    fallback = "The tool run finished, but no final summary was produced. I did not repeat any completed actions."
+    events = [
+        {"type": "assistant", "text": "I am running the collector now."},
+        {"type": "assistant", "text": fallback},
+    ]
+    with caplog.at_level("DEBUG"):
+        _log_openclaw_response(tmp_path, "morning-briefing", fallback, events)
+    assert (tmp_path / "delivered-response.txt").read_text() == fallback
+    assert (tmp_path / "last-observed-assistant.txt").read_text() == fallback
+    assert (tmp_path / "last-model-authored-assistant.txt").read_text() == "I am running the collector now."
+    assert any(record.levelname == "ERROR" and "delivered fallback" in record.message for record in caplog.records)
+    assert any(record.levelname == "DEBUG" and "last model-authored assistant" in record.message for record in caplog.records)
+
+
+def test_openclaw_response_logging_reports_final_answer_at_info(tmp_path, caplog):
+    with caplog.at_level("INFO"):
+        _log_openclaw_response(
+            tmp_path,
+            "analysis-panel",
+            "Final answer",
+            [{"type": "assistant", "text": "Final answer"}],
+        )
+    assert (tmp_path / "delivered-response.txt").read_text() == "Final answer"
+    assert any(record.levelname == "INFO" and "Final answer" in record.message for record in caplog.records)
+
+
+def test_raw_model_logging_keeps_last_visible_text_without_logging_thinking(tmp_path, caplog):
+    stream = tmp_path / "openclaw-raw-stream.jsonl"
+    stream.write_text("\n".join([
+        json.dumps({"event": "assistant_message_end", "rawText": "before", "rawThinking": "private"}),
+        json.dumps({"event": "assistant_message_end", "rawText": "partial final", "rawThinking": "reasoning"}),
+    ]))
+    with caplog.at_level("DEBUG"):
+        _log_raw_model_response(tmp_path, "morning-briefing")
+    assert (tmp_path / "last-raw-model-text.txt").read_text() == "partial final"
+    assert "partial final" in caplog.text
+    assert "reasoning" not in caplog.text
 
 
 @pytest.mark.parametrize("code,expected", [(0, True), (3, False), (2, True), (127, True)])

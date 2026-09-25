@@ -39,6 +39,10 @@ from agent_eval.openshell.sandbox import OpenShellSandbox
 
 logger = logging.getLogger(__name__)
 
+_SETTLED_TURN_FALLBACK = "The tool run finished, but no final summary was produced."
+_RESPONSE_LOG_PREVIEW_CHARS = 600
+_RAW_STREAM_PATH = "/sandbox/.openclaw/tmp/aeh-raw-stream.jsonl"
+
 
 def _diagnostic_text(value: object) -> str:
     """Remove known credential values before writing routine diagnostics."""
@@ -59,6 +63,74 @@ def _last_assistant_text(events: list) -> str:
     return ""
 
 
+def _log_openclaw_response(case_output: Path, case_id: str, response: str, events: list) -> None:
+    """Retain the delivered reply and last observed assistant text separately."""
+    observed = _last_assistant_text(events)
+    previous = next(
+        (
+            event["text"] for event in reversed(events)
+            if event.get("type") == "assistant"
+            and isinstance(event.get("text"), str)
+            and event["text"].strip()
+            and _SETTLED_TURN_FALLBACK not in event["text"]
+        ),
+        "",
+    )
+    (case_output / "delivered-response.txt").write_text(response)
+    (case_output / "last-observed-assistant.txt").write_text(observed)
+    (case_output / "last-model-authored-assistant.txt").write_text(previous)
+    if _SETTLED_TURN_FALLBACK in response:
+        logger.error(
+            "OpenClaw delivered fallback case=%s; last model-authored assistant message=%r; "
+            "full text in %s",
+            case_id,
+            _diagnostic_text(previous)[:_RESPONSE_LOG_PREVIEW_CHARS],
+            case_output / "last-model-authored-assistant.txt",
+        )
+        if not previous:
+            logger.warning("No earlier assistant message was recovered for case=%s", case_id)
+    elif response.strip():
+        logger.info(
+            "OpenClaw final response case=%s chars=%d preview=%r; full text in %s",
+            case_id,
+            len(response),
+            _diagnostic_text(response)[:_RESPONSE_LOG_PREVIEW_CHARS],
+            case_output / "delivered-response.txt",
+        )
+    else:
+        logger.error("OpenClaw produced no final response for case=%s; diagnostics: %s", case_id, case_output)
+    logger.debug("OpenClaw delivered response case=%s text=%r", case_id, _diagnostic_text(response))
+    logger.debug("OpenClaw last observed assistant case=%s text=%r", case_id, _diagnostic_text(observed))
+    logger.debug("OpenClaw last model-authored assistant case=%s text=%r", case_id, _diagnostic_text(previous))
+
+
+def _log_raw_model_response(case_output: Path, case_id: str) -> None:
+    """Report the last pre-filter assistant text from an opt-in OpenClaw raw stream."""
+    stream = case_output / "openclaw-raw-stream.jsonl"
+    last = None
+    for line in stream.read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "assistant_message_end":
+            last = event
+    if last is None:
+        logger.warning("OpenClaw raw stream has no completed assistant message for case=%s", case_id)
+        return
+    text = last.get("rawText") if isinstance(last.get("rawText"), str) else ""
+    (case_output / "last-raw-model-text.txt").write_text(text)
+    logger.info(
+        "OpenClaw last raw model text case=%s chars=%d thinking_chars=%d preview=%r; full text in %s",
+        case_id,
+        len(text),
+        len(last.get("rawThinking") or ""),
+        _diagnostic_text(text)[:_RESPONSE_LOG_PREVIEW_CHARS],
+        case_output / "last-raw-model-text.txt",
+    )
+    logger.debug("OpenClaw last raw model text case=%s text=%r", case_id, _diagnostic_text(text))
+
+
 def _write_failure(case_output: Path, phase: str, error: object, exit_code: int | None = None) -> None:
     failure = {
         "phase": phase,
@@ -67,6 +139,9 @@ def _write_failure(case_output: Path, phase: str, error: object, exit_code: int 
         "artifacts": [name for name in (
             "stdout.log", "stderr.log", "run_result.json", "events.json",
             "openclaw-trajectory-events.jsonl", "agent-response.txt",
+            "delivered-response.txt", "last-observed-assistant.txt",
+            "last-model-authored-assistant.txt", "openclaw-raw-stream.jsonl",
+            "last-raw-model-text.txt",
         ) if (case_output / name).is_file()],
     }
     (case_output / "failure.json").write_text(json.dumps(failure, indent=2))
@@ -946,6 +1021,12 @@ async def run_openshell(
         Exit code (non-zero on regression).
     """
     config = EvalConfig.from_yaml(config_path)
+    configured_log_level = config.runner.settings.get("log_level")
+    if configured_log_level is not None:
+        configured_log_level = str(configured_log_level).upper()
+        if configured_log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+            raise ValueError("runner.settings.log_level must be DEBUG, INFO, WARNING, or ERROR")
+        logger.setLevel(getattr(logging, configured_log_level))
     sandbox_mgr = OpenShellSandbox.from_env()
 
     # Resolve to absolute path once - subprocesses run with different cwd
@@ -1339,6 +1420,10 @@ async def _run_case(
             # Build env to forward to sandbox (API keys + config env + M365_*)
             sandbox_env = _sandbox_env(config)
             sandbox_env.update({k: v for k, v in sandbox_env_extra.items() if v})
+            capture_raw_stream = (
+                os.environ.get("AGENT_EVAL_CAPTURE_RAW_MODEL_STREAM") == "1"
+                or config.runner.settings.get("capture_raw_model_stream") is True
+            )
             if forge_image:
                 # This profile uses supervisor-injected provider placeholders,
                 # not raw orchestrator credentials or AEH-created tool wrappers.
@@ -1388,6 +1473,10 @@ async def _run_case(
                 stdin_data = prompt.encode()
             else:
                 # OpenClaw runner (default)
+                if capture_raw_stream:
+                    sandbox_env["OPENCLAW_RAW_STREAM"] = "1"
+                    sandbox_env["OPENCLAW_RAW_STREAM_PATH"] = _RAW_STREAM_PATH
+                    logger.warning("OpenClaw raw model stream enabled for case=%s; private case artifact will contain model data", case_id)
                 # Custom providers (e.g. inference.local) must be registered in
                 # openclaw.json and passed via --config. --auth-env-only skips
                 # config entirely (OpenClaw docs), so it cannot be used together
@@ -1580,6 +1669,13 @@ async def _run_case(
                     if not partial and case_result.get("response_text"):
                         partial = case_result["response_text"]
                     (case_output / "agent-response.txt").write_text(partial)
+                    _log_openclaw_response(case_output, case_id, response_text, events)
+                    if capture_raw_stream:
+                        try:
+                            await sandbox.download(name, _RAW_STREAM_PATH, case_output / "openclaw-raw-stream.jsonl")
+                            _log_raw_model_response(case_output, case_id)
+                        except Exception as error:
+                            logger.warning("OpenClaw raw stream unavailable for case=%s: %s", case_id, _diagnostic_text(error))
             else:
                 # Generic result for cli/claude-code runners
                 case_result = {
@@ -1640,8 +1736,11 @@ def main():
     )
     args = parser.parse_args()
 
+    log_level = os.environ.get("AGENT_EVAL_LOG_LEVEL", "INFO").upper()
+    if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        raise ValueError("AGENT_EVAL_LOG_LEVEL must be DEBUG, INFO, WARNING, or ERROR")
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
