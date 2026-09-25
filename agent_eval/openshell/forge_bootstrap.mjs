@@ -24,11 +24,26 @@ try {
     // tables. Match Forge's bootstrap, using the image's own schema owner.
     db.exec('PRAGMA auto_vacuum = NONE; VACUUM;');
     const dist = '/opt/openclaw/node_modules/openclaw/dist';
-    const modules = fs.readdirSync(dist).filter(n => /^openclaw-agent-db-maintenance-.*\.js$/.test(n));
-    if (modules.length !== 1) throw new Error('Expected one image database initializer');
-    const maintenance = await import(pathToFileURL(path.join(dist, modules[0])).href);
-    const initialize = Object.values(maintenance).find(v => typeof v === 'function' && v.name === 'ensureOpenClawAgentDatabaseSchema');
-    if (!initialize) throw new Error('Image database initializer unavailable');
+    const modules = fs.readdirSync(dist).filter(n =>
+      /^openclaw-agent-db(?:-maintenance)?-.*\.(?:js|mjs)$/.test(n));
+    const initializers = [];
+    for (const moduleName of modules) {
+      const mod = await import(pathToFileURL(path.join(dist, moduleName)).href);
+      // Prefer the public named export. Older images expose only a minified
+      // export key, so accept its function name when there is one candidate.
+      const initialize = mod.ensureOpenClawAgentDatabaseSchema
+        ?? Object.values(mod).find(v =>
+          typeof v === 'function' && v.name === 'ensureOpenClawAgentDatabaseSchema');
+      if (initialize) initializers.push({moduleName, initialize,
+        named: Boolean(mod.ensureOpenClawAgentDatabaseSchema)});
+    }
+    const named = initializers.filter(candidate => candidate.named);
+    const selected = named.length === 1 ? named[0]
+      : initializers.length === 1 ? initializers[0] : null;
+    if (!selected) {
+      throw new Error(`Expected one image database initializer; found ${initializers.length} in ${modules.join(', ')}`);
+    }
+    const initialize = selected.initialize;
     initialize(db, {agentId, path: databasePath});
   }
   const meta = db.prepare('SELECT role, schema_version, agent_id FROM schema_meta WHERE meta_key = ?').get('primary');
