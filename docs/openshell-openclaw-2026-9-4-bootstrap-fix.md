@@ -56,3 +56,16 @@ and evaluation definitions unchanged for a controlled rerun. Do not interpret
 judge scores from the failed PipelineRun as skill quality; neither case reached
 agent execution. Its cleanup TaskRun also failed independently because
 `registry.redhat.io/openshift4/ose-cli:latest` is unsupported.
+
+## First CI rerun and follow-up
+
+The first rerun was `sana-morning-briefing-main-harness-fix-ktm8d`. Both
+cases logged `IMAGE_FILE_READABLE` and `FORGE_IMAGE_WORKSPACE_OK`, proving
+that the database initializer fix works in `saw-mpk`. The next preflight
+returned HTTP 200 with 128 completion tokens, all of them reasoning tokens,
+and an empty content field. No agent execution occurred.
+
+This branch therefore also raises the OpenShell GLM preflight request from
+128 to 512 completion tokens, matching the existing
+`mpk/flash-preflight-512` harness variant. The test asserts that the
+preflight sends 512. The SAW image and evaluation definitions remain unchanged.

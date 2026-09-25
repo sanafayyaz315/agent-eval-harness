@@ -59,6 +59,8 @@ def test_llm_preflight_resolves_environment_reference_in_memory(tmp_path, monkey
     argv = sandbox.exec.call_args.args[1]
     stub = (
         "global.fetch=async(url,opts)=>{"
+        "const body=JSON.parse(opts.body);"
+        "if(body.max_tokens!==512)throw new Error('insufficient preflight budget');"
         "if(opts.headers.authorization!=='Bearer synthetic-test-value')throw new Error('bad auth');"
         "return {ok:true,status:200,text:async()=>JSON.stringify({choices:[{message:{content:'OK'}}]})};};"
     )

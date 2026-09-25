@@ -352,7 +352,7 @@ async def _run_openclaw_llm_preflight(
         # GLM can spend a small completion budget on hidden reasoning before
         # producing visible text; 20 tokens can therefore yield an empty
         # content field even when the model is healthy.
-        "max_tokens:128,temperature:0})})"
+        "max_tokens:512,temperature:0})})"
         ".then(async r=>{const text=await r.text();"
         "if(!r.ok)throw new Error('HTTP '+r.status+' '+text.slice(0,300));"
         "let body;try{body=JSON.parse(text)}catch{throw new Error('non-JSON response: '+text.slice(0,300))}"
