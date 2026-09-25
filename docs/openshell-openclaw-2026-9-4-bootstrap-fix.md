@@ -69,3 +69,18 @@ This branch therefore also raises the OpenShell GLM preflight request from
 128 to 512 completion tokens, matching the existing
 `mpk/flash-preflight-512` harness variant. The test asserts that the
 preflight sends 512. The SAW image and evaluation definitions remain unchanged.
+
+## Second CI rerun
+
+The second rerun was `sana-morning-briefing-main-preflight-fix-jtvcz`, using
+harness commit `ecd3babc7077dec0f5346fec12d7cd2de58eab45` and the same
+pinned SAW image. Both sandboxes logged `FORGE_IMAGE_WORKSPACE_OK`, and both
+GLM Flash preflights logged `LLM_PREFLIGHT_OK`. Agent execution therefore
+started for both cases.
+
+`morning-briefing` exited 0 and returned a response. `analysis-panel` exited
+1 after OpenClaw reported `Provider returned an incomplete or malformed tool
+call`; its trajectory was harvested. The AEH report recorded mean reward
+`0.150`, pass rate `1/2`, and a failed recommendation against threshold
+`0.5`. MLflow run `71e3fde3e22a4a8da3bb36570b36c0b8` includes two traces.
+The PipelineRun also had the independent `ose-cli:latest` cleanup pull failure.
