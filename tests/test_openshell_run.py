@@ -872,6 +872,9 @@ class TestOpenclawEvalConfig:
         )
         assert qualified == "inference/claude-sonnet"
         assert cfg["agents"]["ownership"] == "explicit"
+        for owner in ("heartbeat", "systemAgent", "authInheritance"):
+            assert cfg["agents"]["defaults"][owner] == {"agentId": "main"}
+        assert cfg["talk"] == {"agentId": "main"}
         entries = cfg["agents"]["entries"]
         assert set(entries) == {"main", "brief-reader"}
         assert entries["main"]["workspace"] == "/sandbox"

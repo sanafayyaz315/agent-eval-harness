@@ -377,6 +377,9 @@ def build_openclaw_eval_config(
         # Its headless parent is `main` (Forge's gateway parent is `default`).
         # Keep the same narrow child boundary used by the published image.
         openclaw_config["agents"]["ownership"] = "explicit"
+        for owner in ("heartbeat", "systemAgent", "authInheritance"):
+            openclaw_config["agents"]["defaults"][owner] = {"agentId": "main"}
+        openclaw_config["talk"] = {"agentId": "main"}
         openclaw_config["agents"]["entries"] = {
             "main": {
                 "workspace": "/sandbox",
