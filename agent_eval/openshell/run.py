@@ -343,7 +343,9 @@ def _openclaw_model_catalog_entry(model_id: str, name: str = "", api: str = "") 
     return entry
 
 
-def build_openclaw_eval_config(providers: dict, model: str) -> tuple:
+def build_openclaw_eval_config(
+    providers: dict, model: str, *, forge_image: bool = False
+) -> tuple:
     """Build /sandbox/openclaw-eval.json and the --model OpenClaw should receive.
 
     Pipeline --model is often a LiteLLM alias (claude-sonnet). OpenClaw needs
@@ -369,6 +371,33 @@ def build_openclaw_eval_config(providers: dict, model: str) -> tuple:
             "providers": {},
         },
     }
+    if forge_image:
+        # OpenShell's evaluation keepalive bypasses the image entrypoint, so the
+        # image's generated OpenClaw policy is not present for `agent exec`.
+        # Its headless parent is `main` (Forge's gateway parent is `default`).
+        # Keep the same narrow child boundary used by the published image.
+        openclaw_config["agents"]["entries"] = {
+            "main": {
+                "workspace": "/sandbox",
+                "subagents": {"allowAgents": ["brief-reader"]},
+                "tools": {"allow": [
+                    "read", "write", "edit", "apply_patch", "exec", "process",
+                    "memory_search", "memory_get", "session_status",
+                    "sessions_list", "sessions_history", "sessions_spawn",
+                    "sessions_yield", "automations", "tavily_search",
+                    "tavily_extract",
+                ]},
+            },
+            "brief-reader": {
+                "workspace": "/sandbox",
+                "tools": {"allow": ["read", "write"]},
+            },
+        }
+        openclaw_config["tools"] = {
+            "deny": ["browser", "canvas", "web_fetch", "web_search"],
+            "codeMode": False,
+            "fs": {"workspaceOnly": True},
+        }
     for name, provider_cfg in providers.items():
         provider_cfg = provider_cfg or {}
         raw_base = provider_cfg.get("baseUrl", "")
@@ -1500,7 +1529,7 @@ async def _run_case(
                 sandbox_env["TMPDIR"] = str(_OPENCLAW_TMP_DIR)
                 if providers:
                     openclaw_config, openclaw_model = build_openclaw_eval_config(
-                        providers, model
+                        providers, model, forge_image=forge_image
                     )
                     # Custom providers are openai-compatible (LiteLLM / inference.local).
                     # Anthropic env makes OpenClaw discover api.anthropic.com.

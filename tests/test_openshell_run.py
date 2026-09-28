@@ -866,6 +866,30 @@ class TestOpenclawEvalConfig:
         assert inf["api"] == "openai-completions"
         assert inf["baseUrl"] == "https://inference.local/v1"
 
+    def test_forge_eval_config_preserves_restricted_batch_reader(self):
+        cfg, qualified = build_openclaw_eval_config(
+            self._WXNB_PROVIDERS, "claude-sonnet", forge_image=True
+        )
+        assert qualified == "inference/claude-sonnet"
+        entries = cfg["agents"]["entries"]
+        assert set(entries) == {"main", "brief-reader"}
+        assert entries["main"]["workspace"] == "/sandbox"
+        assert entries["main"]["subagents"]["allowAgents"] == ["brief-reader"]
+        assert "sessions_spawn" in entries["main"]["tools"]["allow"]
+        assert "sessions_yield" in entries["main"]["tools"]["allow"]
+        assert entries["brief-reader"] == {
+            "workspace": "/sandbox", "tools": {"allow": ["read", "write"]}
+        }
+        assert cfg["tools"]["fs"]["workspaceOnly"] is True
+        assert "web_fetch" in cfg["tools"]["deny"]
+
+    def test_non_forge_eval_config_does_not_add_agent_profiles(self):
+        cfg, _ = build_openclaw_eval_config(
+            self._WXNB_PROVIDERS, "claude-sonnet"
+        )
+        assert "entries" not in cfg["agents"]
+        assert "tools" not in cfg
+
     def test_cluster_litellm_provider(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "mock")
         providers = {
