@@ -504,6 +504,27 @@ async def _start_forge_openclaw_gateway(
     )
 
 
+async def _wait_for_full_forge_brief(
+    sandbox: OpenShellSandbox, name: str, timeout_s: int
+) -> bool:
+    """Keep the Gateway alive while spawned readers and parent resume."""
+    deadline = time.monotonic() + timeout_s
+    probe = (
+        "const fs=require('fs');try{"
+        "const b=JSON.parse(fs.readFileSync('/sandbox/brief.json','utf8'));"
+        "process.exit(b.scope==='full'?0:1)"
+        "}catch{process.exit(1)}"
+    )
+    while time.monotonic() < deadline:
+        status = await sandbox.exec(name, ["node", "-e", probe], timeout_s=10)
+        if status.return_code == 0:
+            logger.info("Gateway child continuation published scope=full in %s", name)
+            return True
+        await asyncio.sleep(5)
+    logger.warning("Gateway child continuation did not publish scope=full in %s", name)
+    return False
+
+
 async def _run_openclaw_llm_preflight(
     sandbox: OpenShellSandbox,
     sandbox_name: str,
@@ -1705,6 +1726,7 @@ async def _run_case(
             )
             timeout = (config.execution.timeout or 600) + 60
             phase = "agent-exec"
+            full_brief_seen = False
             result = await sandbox.exec(
                 name,
                 cmd,
@@ -1714,26 +1736,37 @@ async def _run_case(
                 timeout_s=timeout,
             )
             if runner_type == "openclaw" and forge_image:
-                # Gateway workers can still append to the raw stream after
-                # the CLI returns; quiesce them before tar downloads it.
-                await sandbox.exec(
-                    name,
-                    ["/bin/sh", "-c", "kill $(cat /sandbox/.openclaw/gateway.pid) "
-                     "2>/dev/null || true; sleep 2"],
-                    timeout_s=10,
-                )
                 try:
                     envelope = json.loads(result.stdout)
                     if isinstance(envelope, dict):
+                        gateway_result = envelope.get("result") or {}
+                        spawns = gateway_result.get("acceptedSessionSpawns") or []
                         logger.info(
-                            "Gateway response shape case=%s keys=%s result_keys=%s",
+                            "Gateway response shape case=%s keys=%s result_keys=%s accepted_spawns=%s continuation_settled=%s",
                             case_id,
                             sorted(envelope),
-                            sorted(envelope.get("result", {}))
-                            if isinstance(envelope.get("result"), dict) else [],
+                            sorted(gateway_result) if isinstance(gateway_result, dict) else [],
+                            len(spawns),
+                            gateway_result.get("requesterContinuationSettled")
+                            if isinstance(gateway_result, dict) else None,
                         )
+                        if spawns:
+                            full_brief_seen = await _wait_for_full_forge_brief(
+                                sandbox, name, config.execution.timeout or 600
+                            )
                 except (TypeError, ValueError):
                     logger.warning("Gateway response was not one JSON object for %s", case_id)
+                # Snapshot live diagnostic files before downloading; a child
+                # may still be appending even after the parent turn returns.
+                await sandbox.exec(
+                    name,
+                    ["/bin/sh", "-c", "cp -a /sandbox/.openclaw/tmp "
+                     "/sandbox/.openclaw/tmp-snapshot 2>/dev/null || true; "
+                     "cp /sandbox/.openclaw/tmp/aeh-raw-stream.jsonl "
+                     "/sandbox/.openclaw/aeh-raw-stream-snapshot.jsonl "
+                     "2>/dev/null || true"],
+                    timeout_s=20,
+                )
             _log_model_diagnostics(case_id, openclaw_model, sandbox_env, name)
             duration_s = time.monotonic() - start_time
             if result.return_code:
@@ -1755,8 +1788,13 @@ async def _run_case(
                         if not await _openclaw_output_present(sandbox, name):
                             continue
                     try:
+                        remote_output = (
+                            "/sandbox/.openclaw/tmp-snapshot"
+                            if forge_image and output.path == ".openclaw/tmp"
+                            else f"/sandbox/{output.path}"
+                        )
                         await sandbox.download(
-                            name, f"/sandbox/{output.path}", staged_case / output.path
+                            name, remote_output, staged_case / output.path
                         )
                     except Exception as e:
                         # OpenClaw prompt cases often never create /sandbox/output;
@@ -1805,6 +1843,11 @@ async def _run_case(
                         case_id,
                         len(events),
                     )
+                    if full_brief_seen and not response_text:
+                        response_text = _last_assistant_text(events)
+                        if response_text:
+                            case_result["response_text"] = response_text
+                            (output_dir / "response.txt").write_text(response_text)
                 except Exception as e:
                     logger.warning(f"Failed to generate events.json for {case_id}: {e}")
                 finally:
@@ -1821,7 +1864,11 @@ async def _run_case(
                     _log_openclaw_response(case_output, case_id, response_text, events)
                     if capture_raw_stream:
                         try:
-                            await sandbox.download(name, _RAW_STREAM_PATH, case_output / "openclaw-raw-stream.jsonl")
+                            stream_path = (
+                                "/sandbox/.openclaw/aeh-raw-stream-snapshot.jsonl"
+                                if forge_image else _RAW_STREAM_PATH
+                            )
+                            await sandbox.download(name, stream_path, case_output / "openclaw-raw-stream.jsonl")
                             _log_raw_model_response(case_output, case_id)
                         except Exception as error:
                             logger.warning("OpenClaw raw stream unavailable for case=%s: %s", case_id, _diagnostic_text(error))
