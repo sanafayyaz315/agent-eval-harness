@@ -675,7 +675,9 @@ async def _harvest_openclaw_events(
             f"agent:main:aeh-{case_id}" if gateway_session
             else build_explicit_openclaw_session_key(session_id)
         )
-        export_name = f"aeh-{case_id}"
+        # A Gateway continuation may add turns after the first export. Use a
+        # fresh destination when polling rather than re-reading a stale file.
+        export_name = f"aeh-{case_id}-{uuid.uuid4().hex[:6]}"
         try:
             export_result = await sandbox.exec(
                 name,
@@ -1836,6 +1838,26 @@ async def _run_case(
                         case_output=case_output,
                         sandbox_env=sandbox_env,
                     )
+                    if full_brief_seen:
+                        report_deadline = time.monotonic() + 120
+                        while (
+                            time.monotonic() < report_deadline
+                            and not (
+                                events and events[-1].get("type") == "assistant"
+                                and events[-1].get("text")
+                                and not events[-1].get("tools")
+                            )
+                        ):
+                            await asyncio.sleep(5)
+                            events = await _harvest_openclaw_events(
+                                sandbox,
+                                name,
+                                stdout_text=result.stdout,
+                                prompt=prompt,
+                                case_id=case_id,
+                                case_output=case_output,
+                                sandbox_env=sandbox_env,
+                            )
                     with open(case_output / "events.json", "w") as f:
                         json.dump(events, f, indent=2)
                     logger.debug(
@@ -1843,7 +1865,17 @@ async def _run_case(
                         case_id,
                         len(events),
                     )
-                    if full_brief_seen and not response_text:
+                    terminal_report = bool(
+                        events and events[-1].get("type") == "assistant"
+                        and events[-1].get("text")
+                        and not events[-1].get("tools")
+                    )
+                    if full_brief_seen and not terminal_report:
+                        logger.warning(
+                            "Full brief exists, but no final parent report was observed for %s",
+                            case_id,
+                        )
+                    if full_brief_seen and terminal_report and not response_text:
                         response_text = _last_assistant_text(events)
                         if response_text:
                             case_result["response_text"] = response_text
