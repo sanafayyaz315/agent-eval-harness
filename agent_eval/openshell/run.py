@@ -15,6 +15,7 @@ import logging
 import os
 import shlex
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -402,6 +403,13 @@ def build_openclaw_eval_config(
             "codeMode": False,
             "fs": {"workspaceOnly": True},
         }
+        # The restricted child needs the published reply runtime owned by a
+        # Gateway. Embedded `agent exec` accepts the spawn but cannot run it.
+        openclaw_config["gateway"] = {
+            "mode": "local",
+            "bind": "loopback",
+            "auth": {"mode": "token"},
+        }
     for name, provider_cfg in providers.items():
         provider_cfg = provider_cfg or {}
         raw_base = provider_cfg.get("baseUrl", "")
@@ -460,6 +468,38 @@ def build_openclaw_eval_config(
             )
         openclaw_config["models"]["providers"][name] = provider_entry
     return openclaw_config, qualified
+
+
+async def _start_forge_openclaw_gateway(
+    sandbox: OpenShellSandbox, name: str, env: dict[str, str]
+) -> None:
+    """Start one loopback Gateway in this case's isolated OpenShell sandbox."""
+    launched = await sandbox.exec(
+        name,
+        ["/bin/sh", "-c", "openclaw gateway run --bind loopback --port 18789 "
+         ">/sandbox/.openclaw/gateway.log 2>&1 </dev/null &"],
+        env=env,
+    )
+    if launched.return_code:
+        raise RuntimeError(f"OpenClaw Gateway launch failed: {launched.stderr[:500]}")
+    for _ in range(30):
+        ready = await sandbox.exec(
+            name,
+            ["node", "-e", "fetch('http://127.0.0.1:18789/healthz')"
+             ".then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"],
+            env=env,
+            timeout_s=10,
+        )
+        if ready.return_code == 0:
+            return
+        await asyncio.sleep(1)
+    details = await sandbox.exec(
+        name, ["tail", "-n", "30", "/sandbox/.openclaw/gateway.log"]
+    )
+    raise RuntimeError(
+        "OpenClaw Gateway did not become healthy: "
+        + _diagnostic_text(details.stdout or details.stderr)[-1500:]
+    )
 
 
 async def _run_openclaw_llm_preflight(
@@ -1586,27 +1626,65 @@ async def _run_case(
                 if not effort and config.runner.settings:
                     effort = config.runner.settings.get("effort")
 
-                # Pass --state-dir so agent exec keeps SQLite (default temp state
-                # is deleted on exit). Same path as OPENCLAW_STATE_DIR under
-                # /sandbox (Landlock read_write). Needed for trajectory export.
-                cmd = build_openclaw_argv(
-                    model=openclaw_model,
-                    timeout_s=config.execution.timeout,
-                    effort=effort,
-                    cwd=Path("/sandbox"),
-                    auth_env_only=auth_env_only,
-                    config_path=config_path,
-                    state_dir=_OPENCLAW_STATE_DIR,
-                )
-                # Prompt is positional argument in 'agent exec' format
-                cmd.append(prompt)
+                if forge_image:
+                    # `agent exec` has no published child reply runtime. The
+                    # Gateway owns child sessions; keep it loopback-only and
+                    # use an ephemeral token scoped to this sandbox.
+                    sandbox_env["OPENCLAW_GATEWAY_TOKEN"] = secrets.token_urlsafe(32)
+                    sandbox_env["OPENCLAW_GATEWAY_URL"] = "ws://127.0.0.1:18789"
+                    await _start_forge_openclaw_gateway(sandbox, name, sandbox_env)
+                    probe_path = "/sandbox/.openclaw/tmp/aeh-brief-reader-probe.txt"
+                    probe_prompt = (
+                        "Use sessions_spawn with agentId brief-reader and "
+                        "lightContext true. Ask the child to write the exact "
+                        f"text CHILD_OK to {probe_path}. Wait for the child "
+                        "to finish with sessions_yield. Do not write the file "
+                        "yourself. Reply only when the child has finished."
+                    )
+                    probe = await sandbox.exec(
+                        name,
+                        ["openclaw", "agent", "--agent", "main", "--session-key",
+                         "aeh-brief-reader-probe", "--message", probe_prompt,
+                         "--model", openclaw_model, "--timeout", "120", "--json"],
+                        env=sandbox_env,
+                        timeout_s=150,
+                    )
+                    marker = await sandbox.exec(
+                        name,
+                        ["/bin/sh", "-c", f"test \"$(cat {probe_path} 2>/dev/null)\" = CHILD_OK"],
+                    )
+                    if probe.return_code or marker.return_code:
+                        raise RuntimeError(
+                            "brief-reader Gateway probe failed: "
+                            + _diagnostic_text(probe.stderr or probe.stdout)[-700:]
+                        )
+                    cmd = ["openclaw", "agent", "--agent", "main",
+                           "--session-key", f"aeh-{case_id}", "--message", prompt,
+                           "--model", openclaw_model, "--timeout",
+                           str(config.execution.timeout or 600), "--json"]
+                    if effort:
+                        cmd.extend(["--thinking", effort])
+                else:
+                    # Retain the isolated embedded mode for non-Forge images.
+                    cmd = build_openclaw_argv(
+                        model=openclaw_model,
+                        timeout_s=config.execution.timeout,
+                        effort=effort,
+                        cwd=Path("/sandbox"),
+                        auth_env_only=auth_env_only,
+                        config_path=config_path,
+                        state_dir=_OPENCLAW_STATE_DIR,
+                    )
+                    cmd.append(prompt)
                 stdin_data = None
 
             logger.info(
                 "Executing case %s in sandbox %s argv=%s",
                 case_id,
                 name,
-                cmd[:-1] if len(cmd) > 1 else cmd,
+                ["openclaw", "agent", "--agent", "main", "<prompt omitted>"]
+                if runner_type == "openclaw" and forge_image
+                else (cmd[:-1] if len(cmd) > 1 else cmd),
             )
             timeout = (config.execution.timeout or 600) + 60
             phase = "agent-exec"

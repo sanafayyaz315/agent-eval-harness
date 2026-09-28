@@ -886,6 +886,9 @@ class TestOpenclawEvalConfig:
         }
         assert cfg["tools"]["fs"]["workspaceOnly"] is True
         assert "web_fetch" in cfg["tools"]["deny"]
+        assert cfg["gateway"] == {
+            "mode": "local", "bind": "loopback", "auth": {"mode": "token"}
+        }
 
     def test_non_forge_eval_config_does_not_add_agent_profiles(self):
         cfg, _ = build_openclaw_eval_config(
@@ -893,6 +896,7 @@ class TestOpenclawEvalConfig:
         )
         assert "entries" not in cfg["agents"]
         assert "tools" not in cfg
+        assert "gateway" not in cfg
 
     def test_cluster_litellm_provider(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "mock")
