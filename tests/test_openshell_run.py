@@ -871,6 +871,7 @@ class TestOpenclawEvalConfig:
             self._WXNB_PROVIDERS, "claude-sonnet", forge_image=True
         )
         assert qualified == "inference/claude-sonnet"
+        assert cfg["agents"]["ownership"] == "explicit"
         entries = cfg["agents"]["entries"]
         assert set(entries) == {"main", "brief-reader"}
         assert entries["main"]["workspace"] == "/sandbox"
