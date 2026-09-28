@@ -116,6 +116,9 @@ def parse_stream_events(stdout_text, result_cap=DEFAULT_RESULT_CAP):
         except (json.JSONDecodeError, ValueError):
             continue
 
+        if not isinstance(obj, dict):
+            continue
+
         event_type = obj.get("type")
         if event_type == "assistant":
             event = _parse_assistant_event(obj, result_cap)

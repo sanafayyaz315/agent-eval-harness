@@ -195,6 +195,15 @@ class TestParseOpenclawToCaseDict:
         assert result["num_turns"] == 5
         assert result["resolved_model"] == "claude-opus-4-6"
 
+    def test_parse_gateway_result_envelope(self):
+        stdout = json.dumps({"runId": "r1", "result": {
+            "payloads": [{"text": "Brief published"}],
+            "meta": {"agentMeta": {"usage": {"input": 12, "output": 3}}},
+        }}).encode()
+        result = parse_openclaw_to_case_dict(stdout, b"", 0, 3.0)
+        assert result["response_text"] == "Brief published"
+        assert result["token_usage"] == {"input": 12, "output": 3}
+
     def test_parse_failure_to_dict(self):
         result = parse_openclaw_to_case_dict(b"bad", b"stderr", 1, 0.5)
         

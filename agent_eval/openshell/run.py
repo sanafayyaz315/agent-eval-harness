@@ -478,7 +478,8 @@ async def _start_forge_openclaw_gateway(
     launched = await sandbox.exec(
         name,
         ["/bin/sh", "-c", "openclaw gateway run --bind loopback --port 18789 "
-         ">/sandbox/.openclaw/gateway.log 2>&1 </dev/null &"],
+         ">/sandbox/.openclaw/gateway.log 2>&1 </dev/null & "
+         "echo $! >/sandbox/.openclaw/gateway.pid"],
         env=env,
     )
     if launched.return_code:
@@ -625,6 +626,11 @@ async def _harvest_openclaw_events(
             except (json.JSONDecodeError, ValueError):
                 openclaw_json = {}
 
+    if isinstance(openclaw_json, dict) and isinstance(openclaw_json.get("result"), dict):
+        openclaw_json = openclaw_json["result"]
+    if not isinstance(openclaw_json, dict):
+        openclaw_json = {}
+
     # 1) Legacy session JSONL path
     session_file = resolve_openclaw_session_file(openclaw_json) if openclaw_json else None
     if session_file:
@@ -641,9 +647,13 @@ async def _harvest_openclaw_events(
             logger.warning(f"Failed to read OpenClaw sessionFile for {case_id}: {e}")
 
     # 2) SQLite-era trajectory export (requires retained --state-dir)
-    session_id = (openclaw_json or {}).get("sessionId") or ""
-    if session_id:
-        session_key = build_explicit_openclaw_session_key(session_id)
+    session_id = openclaw_json.get("sessionId") or ""
+    gateway_session = sandbox_env.get("OPENCLAW_GATEWAY_URL")
+    if session_id or gateway_session:
+        session_key = (
+            f"agent:main:aeh-{case_id}" if gateway_session
+            else build_explicit_openclaw_session_key(session_id)
+        )
         export_name = f"aeh-{case_id}"
         try:
             export_result = await sandbox.exec(
@@ -1703,6 +1713,27 @@ async def _run_case(
                 env=sandbox_env,
                 timeout_s=timeout,
             )
+            if runner_type == "openclaw" and forge_image:
+                # Gateway workers can still append to the raw stream after
+                # the CLI returns; quiesce them before tar downloads it.
+                await sandbox.exec(
+                    name,
+                    ["/bin/sh", "-c", "kill $(cat /sandbox/.openclaw/gateway.pid) "
+                     "2>/dev/null || true; sleep 2"],
+                    timeout_s=10,
+                )
+                try:
+                    envelope = json.loads(result.stdout)
+                    if isinstance(envelope, dict):
+                        logger.info(
+                            "Gateway response shape case=%s keys=%s result_keys=%s",
+                            case_id,
+                            sorted(envelope),
+                            sorted(envelope.get("result", {}))
+                            if isinstance(envelope.get("result"), dict) else [],
+                        )
+                except (TypeError, ValueError):
+                    logger.warning("Gateway response was not one JSON object for %s", case_id)
             _log_model_diagnostics(case_id, openclaw_model, sandbox_env, name)
             duration_s = time.monotonic() - start_time
             if result.return_code:

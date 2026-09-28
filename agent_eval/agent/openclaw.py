@@ -99,6 +99,8 @@ def _parse_openclaw_envelope(
     # Try direct JSON parse first
     try:
         data = json.loads(stdout_str)
+        if not isinstance(data, dict):
+            return None, stderr_str + "OpenClaw stdout was not a JSON object"
         error_msg = data.get("error", {}).get("message") or ""
         return data, stderr_str + error_msg
     except json.JSONDecodeError:
@@ -228,6 +230,11 @@ def parse_openclaw_to_case_dict(
             "response_text": "",
             "stderr": error_msg,
         }
+
+    # Gateway-backed `openclaw agent --json` retains its response under
+    # `result`; embedded `agent exec` places the same fields at top level.
+    if isinstance(data.get("result"), dict):
+        data = data["result"]
 
     # Extract metadata from OpenClaw JSON structure.
     # Quay / agent-exec envelope puts usage/model/turns at the top level;
