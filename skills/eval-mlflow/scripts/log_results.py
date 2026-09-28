@@ -370,6 +370,21 @@ def main():
             print(f"WARNING: failed to log harness snapshot artifact: {e}",
                   file=sys.stderr)
 
+        # Preserve numeric OpenClaw turn usage before Tekton deletes its PVC.
+        cases_dir = run_dir / "cases"
+        if cases_dir.is_dir():
+            for case_dir in sorted(cases_dir.iterdir()):
+                usage_path = case_dir / "openclaw-turn-usage.json"
+                if usage_path.is_file():
+                    try:
+                        mlflow.log_artifact(str(usage_path), f"turn-usage/{case_dir.name}")
+                    except Exception as exc:
+                        print(
+                            f"WARNING: could not retain OpenClaw turn usage for case={case_dir.name}: "
+                            f"{type(exc).__name__}",
+                            file=sys.stderr,
+                        )
+
         # Preserve opt-in OpenClaw diagnostics before Tekton deletes its PVC.
         # The raw stream can contain prompts, provider data, and reasoning:
         # retain it as a private artifact, never print its contents to logs.

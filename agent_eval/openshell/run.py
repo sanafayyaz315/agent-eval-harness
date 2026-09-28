@@ -37,6 +37,7 @@ from agent_eval.events import (
     resolve_openclaw_session_key_from_list,
 )
 from agent_eval.openshell.sandbox import OpenShellSandbox
+from agent_eval.openshell.turn_usage import extract_openclaw_turn_usage
 
 logger = logging.getLogger(__name__)
 
@@ -630,6 +631,9 @@ async def _harvest_openclaw_events(
         try:
             cat_result = await sandbox.exec(name, ["cat", session_file])
             if cat_result.return_code == 0 and cat_result.stdout:
+                (case_output / "openclaw-turn-usage.json").write_text(
+                    json.dumps(extract_openclaw_turn_usage(cat_result.stdout, trajectory=False), indent=2) + "\n"
+                )
                 events = parse_openclaw_session(cat_result.stdout)
                 if events:
                     return events
@@ -715,6 +719,9 @@ async def _harvest_openclaw_events(
                     # Keep raw export for debugging / offline reparse
                     (case_output / "openclaw-trajectory-events.jsonl").write_text(
                         cat_events.stdout
+                    )
+                    (case_output / "openclaw-turn-usage.json").write_text(
+                        json.dumps(extract_openclaw_turn_usage(cat_events.stdout, trajectory=True), indent=2) + "\n"
                     )
                     events = parse_openclaw_trajectory_events(cat_events.stdout)
                     if events:
