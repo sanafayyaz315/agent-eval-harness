@@ -370,6 +370,32 @@ def main():
             print(f"WARNING: failed to log harness snapshot artifact: {e}",
                   file=sys.stderr)
 
+        # Preserve opt-in OpenClaw diagnostics before Tekton deletes its PVC.
+        # The raw stream can contain prompts, provider data, and reasoning:
+        # retain it as a private artifact, never print its contents to logs.
+        cases_dir = run_dir / "cases"
+        if (
+            config.runner.settings.get("capture_raw_model_stream") is True
+            and cases_dir.is_dir()
+        ):
+            for case_dir in sorted(cases_dir.iterdir()):
+                if not case_dir.is_dir():
+                    continue
+                stream = case_dir / "openclaw-raw-stream.jsonl"
+                if stream.is_file():
+                    try:
+                        mlflow.log_artifact(str(stream), f"private-diagnostics/{case_dir.name}")
+                        print(
+                            f"Retained private OpenClaw raw stream for case={case_dir.name} "
+                            f"bytes={stream.stat().st_size}"
+                        )
+                    except Exception as exc:
+                        print(
+                            f"WARNING: could not retain raw stream for case={case_dir.name}: "
+                            f"{type(exc).__name__}",
+                            file=sys.stderr,
+                        )
+
         # Log input files for from-traces extraction.
         for name in ("batch.yaml", "case_order.yaml"):
             p = run_dir / name
