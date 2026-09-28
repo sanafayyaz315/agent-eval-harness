@@ -106,6 +106,60 @@ def _log_openclaw_response(case_output: Path, case_id: str, response: str, event
     logger.debug("OpenClaw last model-authored assistant case=%s text=%r", case_id, _diagnostic_text(previous))
 
 
+def _log_openclaw_token_usage(case_output: Path, case_id: str, case_result: dict) -> None:
+    """Log numeric usage once after the final trajectory harvest."""
+
+    def count(value: object) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    usage_path = case_output / "openclaw-turn-usage.json"
+    if usage_path.is_file():
+        try:
+            artifact = json.loads(usage_path.read_text())
+            if not isinstance(artifact, dict):
+                raise ValueError("turn usage artifact is not an object")
+            turns = artifact.get("turns", [])
+            if not isinstance(turns, list):
+                raise ValueError("turns is not a list")
+            for turn in turns:
+                if not isinstance(turn, dict):
+                    continue
+                record = {key: count(turn.get(key)) for key in (
+                    "turn", "input_tokens", "cache_read_tokens",
+                    "cache_write_tokens", "output_tokens", "reasoning_tokens",
+                )}
+                record["case"] = case_id
+                record["scope"] = "turn"
+                reason = turn.get("stop_reason")
+                record["stop_reason"] = (
+                    reason if isinstance(reason, str) and reason in
+                    {"stop", "toolUse", "length", "error", "aborted"} else
+                    None if reason is None else "other"
+                )
+                source = turn.get("source")
+                record["source"] = (
+                    source if isinstance(source, str) and source in
+                    {"assistant.message", "session.message", "model.completed.lastCallUsage",
+                     "model.completed.usage-unavailable"} else "other"
+                )
+                logger.info("OpenClaw token usage %s", json.dumps(record, sort_keys=True))
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Could not read OpenClaw turn usage for case=%s: %s", case_id, type(exc).__name__)
+    else:
+        logger.warning("OpenClaw turn usage unavailable for case=%s", case_id)
+
+    aggregate = case_result.get("token_usage") or {}
+    if not isinstance(aggregate, dict):
+        aggregate = {}
+    logger.info("OpenClaw token usage %s", json.dumps({
+        "case": case_id,
+        "scope": "case",
+        "source": "harness.case_result",
+        "input_tokens": count(aggregate.get("input")),
+        "output_tokens": count(aggregate.get("output")),
+    }, sort_keys=True))
+
+
 def _log_raw_model_response(case_output: Path, case_id: str) -> None:
     """Report the last pre-filter assistant text from an opt-in OpenClaw raw stream."""
     stream = case_output / "openclaw-raw-stream.jsonl"
@@ -1894,6 +1948,7 @@ async def _run_case(
                         partial = case_result["response_text"]
                     (case_output / "agent-response.txt").write_text(partial)
                     _log_openclaw_response(case_output, case_id, response_text, events)
+                    _log_openclaw_token_usage(case_output, case_id, case_result)
                     if capture_raw_stream:
                         try:
                             stream_path = (

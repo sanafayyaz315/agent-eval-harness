@@ -74,3 +74,59 @@ def test_legacy_session_message_usage():
         "reasoningTokens": 2}, "stopReason": "stop"}})
     row = extract_openclaw_turn_usage(line, trajectory=False)["turns"][0]
     assert (row["input_tokens"], row["output_tokens"], row["reasoning_tokens"]) == (3, 5, 2)
+
+
+def test_evaluate_logs_turns_and_case_total_without_changing_artifact():
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    from agent_eval.openshell.run import _log_openclaw_token_usage
+
+    with TemporaryDirectory() as directory:
+        artifact = Path(directory) / "openclaw-turn-usage.json"
+        artifact.write_text(json.dumps({"schema_version": 1, "turns": [
+            {"turn": 1, "input_tokens": 100, "output_tokens": 20,
+             "reasoning_tokens": 15, "cache_read_tokens": 200,
+             "stop_reason": "toolUse", "source": "assistant.message"},
+            {"turn": 2, "input_tokens": 30, "output_tokens": 16384,
+             "reasoning_tokens": 16000, "stop_reason": "error",
+             "source": "model.completed.lastCallUsage"},
+        ]}))
+        before = artifact.read_bytes()
+        with patch("agent_eval.openshell.run.logger") as log:
+            _log_openclaw_token_usage(Path(directory), "morning-briefing",
+                                      {"token_usage": {"input": 130, "output": 16404}})
+        records = [json.loads(call.args[1]) for call in log.info.call_args_list]
+        assert len(records) == 3
+        assert records[0]["scope"] == "turn" and records[0]["cache_read_tokens"] == 200
+        assert records[1]["output_tokens"] == 16384
+        assert records[1]["reasoning_tokens"] == 16000
+        assert records[1]["stop_reason"] == "error"
+        assert records[2]["scope"] == "case"
+        assert records[2]["output_tokens"] == 16404
+        assert artifact.read_bytes() == before
+
+
+def test_evaluate_logs_unknown_turn_values_without_text():
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    from agent_eval.openshell.run import _log_openclaw_token_usage
+
+    with TemporaryDirectory() as directory:
+        artifact = Path(directory) / "openclaw-turn-usage.json"
+        artifact.write_text(json.dumps({"turns": [
+            {"turn": 1, "input_tokens": "private prompt", "output_tokens": None,
+             "reasoning_tokens": None, "stop_reason": "private response",
+             "source": "model.completed.usage-unavailable"},
+        ]}))
+        with patch("agent_eval.openshell.run.logger") as log:
+            _log_openclaw_token_usage(Path(directory), "morning-briefing",
+                                      {"token_usage": {"input": 0, "output": 0}})
+        records = [json.loads(call.args[1]) for call in log.info.call_args_list]
+        assert records[0]["input_tokens"] is None
+        assert records[0]["output_tokens"] is None
+        assert records[0]["stop_reason"] == "other"
+        assert "private" not in str(records)
